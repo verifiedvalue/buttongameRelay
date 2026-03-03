@@ -47,8 +47,8 @@ const DEFAULT_WS = CLUSTER === "mainnet-beta"
 const RPC_URL = process.env.RPC_URL || DEFAULT_HTTP;
 const WS_URL  = process.env.WS_URL  || DEFAULT_WS;
 
-const STATE_ADDR = "FnCLwBY38p1LUtCs6GaC438EZ3HmanAdAhGB4nfNANAz";
-const VAULT_ADDR = "CbpG1mzYkbPKAKcVMDsjfPnqJhDdHceHXuuQ9UUeA9K";
+const STATE_ADDR = "5sfJLUePwpDJuxUY9X2cW8DKafq7bqxrQ6XD61tWUvQr";
+const VAULT_ADDR = "2436ZcMWA61as89tT99RURppUpT7CjkDoFHmwskwStSa";
 
 const VAULT_TTL_MS = 30_000; // max time between vault reads if plays haven't changed
 
