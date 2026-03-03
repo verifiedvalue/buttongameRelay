@@ -1,0 +1,16 @@
+{
+  "name": "button-game-relay",
+  "version": "1.0.0",
+  "description": "SSE relay server for Button Game – polls Solana once, fans out to all clients",
+  "main": "relay-server.js",
+  "scripts": {
+    "start": "node relay-server.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
