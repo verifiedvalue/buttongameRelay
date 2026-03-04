@@ -104,6 +104,10 @@ async function initPg() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  await pgPool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS usernames_username_lower_key
+    ON usernames (LOWER(TRIM(username)));
+  `);
 
   pgReady = true;
   console.log("[DB] Postgres ready (claims + usernames tables ensured)");
@@ -213,6 +217,27 @@ function validateUsername(u) {
 
 function getName(address) {
   return usernameCache.get(address) || null;
+}
+
+/** Returns true if username is taken by another address (case-insensitive). Pass exceptAddress to allow that address to keep/reuse it. */
+async function isUsernameTaken(username, exceptAddress = "") {
+  const norm = (s) => String(s || "").trim().toLowerCase();
+  const want = norm(username);
+  if (!want) return false;
+  if (pgEnabled() && pgReady) {
+    const { rows } = await pgPool.query(
+      `SELECT address FROM usernames WHERE LOWER(TRIM(username)) = $1`,
+      [want]
+    );
+    if (rows.length === 0) return false;
+    if (exceptAddress && rows.some((r) => r.address === exceptAddress)) return false;
+    return true;
+  }
+  for (const [addr, un] of usernameCache) {
+    if (addr === exceptAddress) continue;
+    if (norm(un) === want) return true;
+  }
+  return false;
 }
 
 function namesForAddresses(addresses) {
@@ -731,6 +756,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET /username/available?username=xyz&address=optional — check if username is available (not taken by another address)
+  if (url.pathname === "/username/available" && req.method === "GET") {
+    const username = (url.searchParams.get("username") || "").trim();
+    const address = (url.searchParams.get("address") || "").trim();
+    const taken = await isUsernameTaken(username, address);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ available: !taken }));
+    return;
+  }
+
   // GET /usernames?addresses=a,b,c
   if (url.pathname === "/usernames" && req.method === "GET") {
     const raw = (url.searchParams.get("addresses") || "").trim();
@@ -766,6 +801,14 @@ const server = http.createServer(async (req, res) => {
     }
     const username = v.username;
 
+    // Enforce unique usernames (case-insensitive): reject if taken by another address
+    const taken = await isUsernameTaken(username, address);
+    if (taken) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Username already taken" }));
+      return;
+    }
+
     // Verify signature
     const ver = verifyUsernameSignature({ address, username, signature, nonce });
     if (!ver.ok) {
@@ -777,6 +820,12 @@ const server = http.createServer(async (req, res) => {
     try {
       await upsertUsername(address, username);
     } catch (e) {
+      const isDuplicate = e?.code === "23505" || /unique|duplicate/i.test(String(e?.message || ""));
+      if (isDuplicate) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Username already taken" }));
+        return;
+      }
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `db update failed: ${e.message}` }));
       return;
