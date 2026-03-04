@@ -1,40 +1,52 @@
 /**
  * Button Game – Relay Server  (WebSocket subscription edition)
  *
- * Instead of polling, this server SUBSCRIBES to on-chain account changes via
- * Solana's WebSocket API. The RPC node pushes a notification the instant the
- * state or vault account is written — typically within 100–400 ms of a tx
- * confirming, with zero polling overhead.
+ * UPDATE:
+ *  - Durable Claim Log persisted to Railway Postgres.
+ *  - Username system tied to wallet address via signature:
+ *      GET  /challenge?address=...
+ *      POST /username  { address, username, signature, nonce }
+ *      GET  /usernames?addresses=a,b,c
  *
- * Architecture:
- *   Solana WS ──push──► relay-server ──SSE fan-out──► all browser clients
+ * SSE:
+ *  - state messages include `names` mapping for any addresses in the payload
+ *  - claim messages include `names`
+ *  - username updates broadcast as { type:"username", address, username }
  *
- * Fallback: a 1-second safety poll runs in the background to catch any missed
- * WS notifications (e.g. dropped messages during reconnect). It is cheap
- * because it only broadcasts when data actually changed.
- *
- * Deploy anywhere Node.js runs: Railway, Render, Fly.io, a VPS, etc.
- *
- * Install:  npm install @solana/web3.js
- * Run:      node relay-server.js
- *
- * Environment variables (all optional):
- *   PORT       – HTTP port (default: 3001)
- *   CLUSTER    – "devnet" | "mainnet-beta" (default: "devnet")
- *   RPC_URL    – HTTP RPC endpoint  (overrides CLUSTER)
- *   WS_URL     – WebSocket RPC endpoint (overrides CLUSTER; must be ws:// or wss://)
- *   POLL_MS    – Safety-poll interval in ms (default: 1000)
+ * Env:
+ *   CLAIM_DB         – "postgres" | "none"    (default: "postgres")
+ *   CLAIM_LOG_MAX    – max claims kept in memory (default: 200)
+ *   CLAIM_DB_URL     – optional override; else DATABASE_PRIVATE_URL or DATABASE_URL
+ *   USERNAME_MAX_LEN – default 18
+ *   USERNAME_MIN_LEN – default 3
+ *   CHALLENGE_TTL_MS – default 5 minutes
  */
 
 "use strict";
 
 const http = require("http");
 const { Connection, PublicKey } = require("@solana/web3.js");
+const { Pool } = require("pg");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const PORT    = Number(process.env.PORT || 3001);
 const CLUSTER = process.env.CLUSTER || "devnet";
-const POLL_MS = Number(process.env.POLL_MS || 1000); // safety-poll fallback
+const POLL_MS = Number(process.env.POLL_MS || 1000);
+
+const CLAIM_LOG_MAX = Number(process.env.CLAIM_LOG_MAX || 200);
+
+const USERNAME_MIN_LEN = Number(process.env.USERNAME_MIN_LEN || 3);
+const USERNAME_MAX_LEN = Number(process.env.USERNAME_MAX_LEN || 18);
+const CHALLENGE_TTL_MS = Number(process.env.CHALLENGE_TTL_MS || 5 * 60 * 1000);
+
+const CLAIM_DB = (process.env.CLAIM_DB || "postgres").toLowerCase();
+const CLAIM_DB_URL =
+  process.env.CLAIM_DB_URL ||
+  process.env.DATABASE_PRIVATE_URL ||
+  process.env.DATABASE_URL ||
+  "";
 
 const DEFAULT_HTTP = CLUSTER === "mainnet-beta"
   ? "https://api.mainnet-beta.solana.com"
@@ -50,7 +62,231 @@ const WS_URL  = process.env.WS_URL  || DEFAULT_WS;
 const STATE_ADDR = "5sfJLUePwpDJuxUY9X2cW8DKafq7bqxrQ6XD61tWUvQr";
 const VAULT_ADDR = "2436ZcMWA61as89tT99RURppUpT7CjkDoFHmwskwStSa";
 
-const VAULT_TTL_MS = 30_000; // max time between vault reads if plays haven't changed
+const VAULT_TTL_MS = 30_000;
+
+// ─── POSTGRES ──────────────────────────────────────────────────────────────
+let pgPool = null;
+let pgReady = false;
+
+function pgEnabled() {
+  return CLAIM_DB === "postgres" && !!CLAIM_DB_URL;
+}
+
+async function initPg() {
+  if (!pgEnabled()) return;
+
+  pgPool = new Pool({
+    connectionString: CLAIM_DB_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 3,
+  });
+
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS claims (
+      id TEXT PRIMARY KEY,
+      detected_at TIMESTAMPTZ NOT NULL,
+      detected_via TEXT,
+      winner TEXT,
+      session_plays INTEGER,
+      timer_end BIGINT,
+      cooldown_end BIGINT,
+      vault_before TEXT,
+      vault_after TEXT,
+      amount TEXT,
+      note TEXT
+    );
+  `);
+
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS usernames (
+      address TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  pgReady = true;
+  console.log("[DB] Postgres ready (claims + usernames tables ensured)");
+}
+
+async function loadRecentClaims(limit = CLAIM_LOG_MAX) {
+  if (!pgEnabled() || !pgReady) return [];
+  const { rows } = await pgPool.query(
+    `SELECT *
+     FROM claims
+     ORDER BY detected_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.reverse().map((r) => ({
+    id: r.id,
+    detectedAtMs: new Date(r.detected_at).getTime(),
+    detectedVia: r.detected_via,
+    winner: r.winner,
+    sessionPlays: r.session_plays,
+    timerEnd: Number(r.timer_end),
+    cooldownEnd: Number(r.cooldown_end),
+    vaultBefore: r.vault_before,
+    vaultAfter: r.vault_after,
+    amount: r.amount,
+    note: r.note,
+  }));
+}
+
+async function persistClaim(entry) {
+  if (!pgEnabled() || !pgReady) return;
+  try {
+    await pgPool.query(
+      `INSERT INTO claims (
+        id, detected_at, detected_via, winner, session_plays,
+        timer_end, cooldown_end, vault_before, vault_after, amount, note
+      ) VALUES (
+        $1, to_timestamp($2 / 1000.0), $3, $4, $5,
+        $6, $7, $8, $9, $10, $11
+      )
+      ON CONFLICT (id) DO NOTHING;`,
+      [
+        entry.id,
+        entry.detectedAtMs,
+        entry.detectedVia,
+        entry.winner,
+        entry.sessionPlays ?? null,
+        entry.timerEnd ?? null,
+        entry.cooldownEnd ?? null,
+        entry.vaultBefore ?? null,
+        entry.vaultAfter ?? null,
+        entry.amount ?? null,
+        entry.note ?? null,
+      ]
+    );
+  } catch (e) {
+    console.warn("[DB] persistClaim failed:", e.message);
+  }
+}
+
+// ─── USERNAMES (cache + DB) ───────────────────────────────────────────────
+const usernameCache = new Map(); // address -> username
+const usernameCacheLoadedAtMs = { v: 0 };
+
+// Load all usernames (small scale), or you can replace with batch fetch per address.
+async function loadAllUsernames() {
+  if (!pgEnabled() || !pgReady) return;
+  const { rows } = await pgPool.query(`SELECT address, username FROM usernames`);
+  usernameCache.clear();
+  for (const r of rows) usernameCache.set(r.address, r.username);
+  usernameCacheLoadedAtMs.v = Date.now();
+  console.log(`[DB] loaded ${rows.length} usernames into cache`);
+}
+
+async function upsertUsername(address, username) {
+  if (!pgEnabled() || !pgReady) {
+    // allow in-memory only fallback (not recommended)
+    usernameCache.set(address, username);
+    return;
+  }
+
+  await pgPool.query(
+    `INSERT INTO usernames (address, username, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (address)
+     DO UPDATE SET username = EXCLUDED.username, updated_at = now();`,
+    [address, username]
+  );
+
+  usernameCache.set(address, username);
+}
+
+function validateUsername(u) {
+  if (typeof u !== "string") return { ok: false, reason: "username must be a string" };
+  const username = u.trim();
+
+  if (username.length < USERNAME_MIN_LEN) return { ok: false, reason: `min length ${USERNAME_MIN_LEN}` };
+  if (username.length > USERNAME_MAX_LEN) return { ok: false, reason: `max length ${USERNAME_MAX_LEN}` };
+
+  // Allowed: letters, numbers, underscore, dash, dot
+  if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
+    return { ok: false, reason: "only letters, numbers, _, -, . allowed" };
+  }
+
+  return { ok: true, username };
+}
+
+function getName(address) {
+  return usernameCache.get(address) || null;
+}
+
+function namesForAddresses(addresses) {
+  const out = {};
+  for (const a of addresses) {
+    const n = getName(a);
+    if (n) out[a] = n;
+  }
+  return out;
+}
+
+// ─── SIGNED CHALLENGES ─────────────────────────────────────────────────────
+const challenges = new Map(); // address -> { nonce, expiresAtMs }
+
+function makeNonce() {
+  // fast nonce (good enough for auth challenge)
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function setChallenge(address) {
+  const nonce = makeNonce();
+  const expiresAtMs = Date.now() + CHALLENGE_TTL_MS;
+  challenges.set(address, { nonce, expiresAtMs });
+  return { nonce, expiresAtMs };
+}
+
+function getChallenge(address) {
+  const c = challenges.get(address);
+  if (!c) return null;
+  if (Date.now() > c.expiresAtMs) {
+    challenges.delete(address);
+    return null;
+  }
+  return c;
+}
+
+function buildUsernameMessage(address, username, nonce) {
+  // IMPORTANT: client must sign EXACTLY this string (UTF-8)
+  return [
+    "ButtonGame Username Set",
+    `Address: ${address}`,
+    `Username: ${username}`,
+    `Nonce: ${nonce}`,
+  ].join("\n");
+}
+
+function verifyUsernameSignature({ address, username, signature, nonce }) {
+  // Validate pubkey
+  let pk;
+  try { pk = new PublicKey(address); }
+  catch { return { ok: false, reason: "invalid address" }; }
+
+  // Validate nonce
+  const c = getChallenge(address);
+  if (!c) return { ok: false, reason: "no active challenge (or expired). call /challenge first" };
+  if (c.nonce !== nonce) return { ok: false, reason: "nonce mismatch" };
+
+  // Decode signature
+  let sigBytes;
+  try { sigBytes = bs58.decode(signature); }
+  catch { return { ok: false, reason: "invalid signature encoding" }; }
+
+  const msg = buildUsernameMessage(address, username, nonce);
+  const msgBytes = new TextEncoder().encode(msg);
+  const pubBytes = pk.toBytes();
+
+  const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
+  if (!ok) return { ok: false, reason: "signature verification failed" };
+
+  // One-time challenge (prevents replay)
+  challenges.delete(address);
+
+  return { ok: true };
+}
 
 // ─── SOLANA ────────────────────────────────────────────────────────────────
 const connection = new Connection(RPC_URL, {
@@ -60,7 +296,7 @@ const connection = new Connection(RPC_URL, {
 const statePk = new PublicKey(STATE_ADDR);
 const vaultPk = new PublicKey(VAULT_ADDR);
 
-// ─── DECODE STATE (mirrors app.js exactly) ─────────────────────────────────
+// ─── DECODE STATE ──────────────────────────────────────────────────────────
 function readPubkey(data, offset) {
   return new PublicKey(data.slice(offset, offset + 32)).toBase58();
 }
@@ -78,7 +314,7 @@ function readU32(data, offset) {
 }
 
 function decodeState(accountData) {
-  const data = accountData.slice(8); // skip Anchor discriminator
+  const data = accountData.slice(8);
   let o = 0;
 
   const owner             = readPubkey(data, o); o += 32;
@@ -105,12 +341,18 @@ function decodeState(accountData) {
 }
 
 // ─── RELAY STATE ───────────────────────────────────────────────────────────
-let latestPayload      = null;   // last SSE message, replayed to new clients instantly
+let latestPayload      = null;
 let lastStateSig       = "";
 let lastPlaysSeen      = null;
 let lastVaultFetchMs   = 0;
 let vaultFetchInFlight = false;
 const clients          = new Set();
+
+let lastGs = null;
+let lastVaultAmountStr = null;
+
+const claimLog = [];
+let pendingClaim = null;
 
 function stateSignature(gs) {
   return [
@@ -125,7 +367,11 @@ function stateSignature(gs) {
 }
 
 function broadcast(data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
+  // Attach names mapping to any message that has addresses
+  // (so clients can render usernames everywhere without extra calls)
+  const enriched = enrichWithNames(data);
+
+  const msg = `data: ${JSON.stringify(enriched)}\n\n`;
   latestPayload = msg;
   for (const res of clients) {
     try { res.write(msg); }
@@ -133,14 +379,87 @@ function broadcast(data) {
   }
 }
 
-// Fetch vault balance and, if it changed, broadcast an updated state payload
+function safeBigInt(s) {
+  try { return BigInt(s); } catch { return null; }
+}
+
+// Collect addresses from payload to attach `{ names: { address: username } }`
+function enrichWithNames(payload) {
+  const addrs = new Set();
+
+  // state payload
+  if (payload?.state) {
+    const s = payload.state;
+    if (s.owner) addrs.add(s.owner);
+    if (s.tokenMint) addrs.add(s.tokenMint);
+    if (s.vault) addrs.add(s.vault);
+    if (s.currentWinner) addrs.add(s.currentWinner);
+    if (s.currentWinnerAta) addrs.add(s.currentWinnerAta);
+  }
+
+  // claim payload
+  if (payload?.claim) {
+    const c = payload.claim;
+    if (c.winner) addrs.add(c.winner);
+  }
+
+  // username payload
+  if (payload?.address) addrs.add(payload.address);
+
+  const names = namesForAddresses([...addrs]);
+  if (Object.keys(names).length) return { ...payload, names };
+  return payload;
+}
+
+function pushClaim(entry) {
+  claimLog.push(entry);
+  while (claimLog.length > CLAIM_LOG_MAX) claimLog.shift();
+
+  persistClaim(entry).catch(() => {});
+
+  broadcast({
+    type: "claim",
+    serverTs: Math.floor(Date.now() / 1000),
+    claim: entry,
+  });
+}
+
+function detectClaimTransition(gs, source) {
+  if (!lastGs) return;
+  const transitioned = (lastGs.unclaimed === true && gs.unclaimed === false);
+  if (!transitioned) return;
+
+  if (pendingClaim) {
+    const entry = {
+      ...pendingClaim,
+      amount: pendingClaim.amount ?? null,
+      note: (pendingClaim.note ? pendingClaim.note + " | " : "") + "superseded-by-new-pending",
+    };
+    pushClaim(entry);
+  }
+
+  pendingClaim = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    detectedAtMs: Date.now(),
+    detectedVia: source,
+    winner: gs.currentWinner,
+    sessionPlays: gs.sessionPlays,
+    timerEnd: gs.timerEnd,
+    cooldownEnd: gs.cooldownEnd,
+    vaultBefore: lastVaultAmountStr,
+    vaultAfter: null,
+    amount: null,
+    note: null,
+  };
+}
+
 async function refreshVault(gs, reason) {
   if (vaultFetchInFlight) return;
-  const nowMs     = Date.now();
-  const plays     = gs.sessionPlays;
-  const changed   = lastPlaysSeen !== null && plays !== lastPlaysSeen;
-  const ttlExpired= (nowMs - lastVaultFetchMs) >= VAULT_TTL_MS;
-  const never     = lastVaultFetchMs === 0;
+  const nowMs      = Date.now();
+  const plays      = gs.sessionPlays;
+  const changed    = lastPlaysSeen !== null && plays !== lastPlaysSeen;
+  const ttlExpired = (nowMs - lastVaultFetchMs) >= VAULT_TTL_MS;
+  const never      = lastVaultFetchMs === 0;
 
   if (!never && !changed && !ttlExpired) return;
 
@@ -148,8 +467,30 @@ async function refreshVault(gs, reason) {
   try {
     const bal = await connection.getTokenAccountBalance(vaultPk, "confirmed");
     const vaultAmount = bal?.value?.amount || "0";
+
+    lastVaultAmountStr = vaultAmount;
     lastVaultFetchMs = Date.now();
     lastPlaysSeen    = plays;
+
+    if (pendingClaim) {
+      pendingClaim.vaultAfter = vaultAmount;
+
+      const beforeBI = safeBigInt(pendingClaim.vaultBefore);
+      const afterBI  = safeBigInt(pendingClaim.vaultAfter);
+
+      if (beforeBI != null && afterBI != null) {
+        const delta = beforeBI - afterBI;
+        pendingClaim.amount = delta > 0n ? delta.toString() : "0";
+        if (delta <= 0n) pendingClaim.note = `vault-delta-nonpositive(${delta.toString()})`;
+      } else {
+        pendingClaim.amount = null;
+        pendingClaim.note = "missing-vault-before-or-after";
+      }
+
+      pushClaim({ ...pendingClaim });
+      pendingClaim = null;
+    }
+
     broadcast({
       type: "state",
       serverTs: Math.floor(Date.now() / 1000),
@@ -158,12 +499,16 @@ async function refreshVault(gs, reason) {
     });
   } catch (e) {
     console.warn(`[Vault] fetch failed (${reason}):`, e.message);
+    if (pendingClaim) {
+      pendingClaim.note = (pendingClaim.note ? pendingClaim.note + " | " : "") + `vault-fetch-failed(${reason})`;
+      pushClaim({ ...pendingClaim });
+      pendingClaim = null;
+    }
   } finally {
     vaultFetchInFlight = false;
   }
 }
 
-// Core handler — called from WS notifications AND safety polls
 async function handleStateData(rawData, source) {
   let gs;
   try { gs = decodeState(rawData); }
@@ -172,19 +517,19 @@ async function handleStateData(rawData, source) {
   const sig     = stateSignature(gs);
   const changed = sig !== lastStateSig;
 
+  if (changed) detectClaimTransition(gs, source);
+
   if (changed) {
     lastStateSig = sig;
     console.log(`[State] changed via ${source} — plays=${gs.sessionPlays} timerEnd=${gs.timerEnd}`);
 
-    // Push state immediately so clients react without waiting for the vault fetch
     broadcast({ type: "state", serverTs: Math.floor(Date.now() / 1000), state: gs });
-
-    // Fetch vault in the background; will broadcast again with vaultAmount attached
     await refreshVault(gs, source);
   } else {
-    // State unchanged — still honour vault TTL refresh
     await refreshVault(gs, `${source}-ttl`);
   }
+
+  lastGs = gs;
 }
 
 // ─── WEBSOCKET SUBSCRIPTIONS ───────────────────────────────────────────────
@@ -196,7 +541,6 @@ async function subscribeAccounts() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
 
   try {
-    // Subscribe to state account — fires on every write to the game state
     stateSubId = connection.onAccountChange(
       statePk,
       (accountInfo) => {
@@ -205,11 +549,9 @@ async function subscribeAccounts() {
       "confirmed"
     );
 
-    // Subscribe to vault token account — fires whenever the balance moves
     vaultSubId = connection.onAccountChange(
       vaultPk,
       async () => {
-        // Re-read state too so sessionPlays is current when we compute vault delta
         try {
           const acc = await connection.getAccountInfo(statePk, "confirmed");
           if (acc?.data) await handleStateData(acc.data, "ws-vault");
@@ -233,22 +575,14 @@ function scheduleWsReconnect(delayMs = 5000) {
   wsReconnectTimer = setTimeout(async () => {
     wsReconnectTimer = null;
     try {
-      if (stateSubId != null) {
-        await connection.removeAccountChangeListener(stateSubId);
-        stateSubId = null;
-      }
-      if (vaultSubId != null) {
-        await connection.removeAccountChangeListener(vaultSubId);
-        vaultSubId = null;
-      }
+      if (stateSubId != null) { await connection.removeAccountChangeListener(stateSubId); stateSubId = null; }
+      if (vaultSubId != null) { await connection.removeAccountChangeListener(vaultSubId); vaultSubId = null; }
     } catch {}
     await subscribeAccounts();
   }, delayMs);
 }
 
 // ─── SAFETY POLL ───────────────────────────────────────────────────────────
-// Runs every POLL_MS (default 1 s) as a catch-all for missed WS messages.
-// handleStateData() is a no-op when nothing changed, so this is very cheap.
 async function safetyPoll() {
   try {
     const acc = await connection.getAccountInfo(statePk, "confirmed");
@@ -260,33 +594,51 @@ async function safetyPoll() {
   }
 }
 
+// ─── HELPERS: JSON body ────────────────────────────────────────────────────
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1_000_000) { // 1MB limit
+        reject(new Error("body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(new Error("invalid json"));
+      }
+    });
+  });
+}
+
 // ─── HTTP / SSE SERVER ─────────────────────────────────────────────────────
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, "http://localhost");
 
-  // ── GET /events  (SSE stream) ──────────────────────────────────────────
+  // SSE
   if (url.pathname === "/events" && req.method === "GET") {
     res.writeHead(200, {
       "Content-Type":      "text/event-stream",
       "Cache-Control":     "no-cache",
       "Connection":        "keep-alive",
-      "X-Accel-Buffering": "no",   // disable nginx buffering
+      "X-Accel-Buffering": "no",
     });
     res.write(": connected\n\n");
-
-    // Replay last known state immediately so new clients don't wait
     if (latestPayload) res.write(latestPayload);
 
     clients.add(res);
     console.log(`[SSE] +client  total=${clients.size}`);
 
-    // Heartbeat every 25 s to keep proxies from closing idle connections
     const hb = setInterval(() => {
       try { res.write(": ping\n\n"); }
       catch { clearInterval(hb); clients.delete(res); }
@@ -300,7 +652,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── GET /state  (one-shot JSON snapshot) ──────────────────────────────
+  // one-shot state snapshot
   if (url.pathname === "/state" && req.method === "GET") {
     if (!latestPayload) {
       res.writeHead(503, { "Content-Type": "application/json" });
@@ -313,8 +665,107 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── GET /health ────────────────────────────────────────────────────────
+  // claim log
+  if (url.pathname === "/claims" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      max: CLAIM_LOG_MAX,
+      count: claimLog.length,
+      claims: claimLog,
+      persisted: pgEnabled() && pgReady,
+    }));
+    return;
+  }
+
+  // ── USERNAMES ──────────────────────────────────────────────────────────
+
+  // GET /challenge?address=...
+  if (url.pathname === "/challenge" && req.method === "GET") {
+    const address = (url.searchParams.get("address") || "").trim();
+    try { new PublicKey(address); } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid address" }));
+      return;
+    }
+    const { nonce, expiresAtMs } = setChallenge(address);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      address,
+      nonce,
+      expiresAtMs,
+      messageToSign: buildUsernameMessage(address, "<username>", nonce),
+      ttlMs: CHALLENGE_TTL_MS,
+    }));
+    return;
+  }
+
+  // GET /usernames?addresses=a,b,c
+  if (url.pathname === "/usernames" && req.method === "GET") {
+    const raw = (url.searchParams.get("addresses") || "").trim();
+    const addresses = raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : [];
+    const out = namesForAddresses(addresses);
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ names: out }));
+    return;
+  }
+
+  // POST /username  { address, username, signature, nonce }
+  if (url.pathname === "/username" && req.method === "POST") {
+    let body;
+    try { body = await readJsonBody(req); }
+    catch (e) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+      return;
+    }
+
+    const address = (body.address || "").trim();
+    const usernameInput = body.username;
+    const signature = (body.signature || "").trim();
+    const nonce = (body.nonce || "").trim();
+
+    // Validate username format
+    const v = validateUsername(usernameInput);
+    if (!v.ok) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `invalid username: ${v.reason}` }));
+      return;
+    }
+    const username = v.username;
+
+    // Verify signature
+    const ver = verifyUsernameSignature({ address, username, signature, nonce });
+    if (!ver.ok) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: ver.reason }));
+      return;
+    }
+
+    try {
+      await upsertUsername(address, username);
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `db update failed: ${e.message}` }));
+      return;
+    }
+
+    // Broadcast username update so all clients can update UI immediately
+    broadcast({
+      type: "username",
+      serverTs: Math.floor(Date.now() / 1000),
+      address,
+      username,
+    });
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, address, username }));
+    return;
+  }
+
+  // health
   if (url.pathname === "/health") {
+    const lastClaim = claimLog.length ? claimLog[claimLog.length - 1] : null;
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok:           true,
@@ -322,6 +773,16 @@ const server = http.createServer((req, res) => {
       wsSubscribed: stateSubId != null,
       lastStateSig,
       uptime:       Math.floor(process.uptime()),
+      claimCount:   claimLog.length,
+      lastClaim,
+      db: {
+        enabled: pgEnabled(),
+        ready: pgReady,
+      },
+      usernames: {
+        cached: usernameCache.size,
+        cacheLoadedAtMs: usernameCacheLoadedAtMs.v,
+      }
     }));
     return;
   }
@@ -336,7 +797,22 @@ server.listen(PORT, async () => {
   console.log(`  RPC  : ${RPC_URL}`);
   console.log(`  WS   : ${WS_URL}\n`);
 
-  // Seed initial state before any subscription fires
+  // Init DB + load caches
+  try {
+    await initPg();
+
+    if (pgEnabled() && pgReady) {
+      const loadedClaims = await loadRecentClaims(CLAIM_LOG_MAX);
+      for (const c of loadedClaims) claimLog.push(c);
+      console.log(`[DB] loaded ${loadedClaims.length} recent claims into memory`);
+
+      await loadAllUsernames();
+    }
+  } catch (e) {
+    console.warn("[DB] init/load failed:", e.message);
+  }
+
+  // Seed initial state
   try {
     const acc = await connection.getAccountInfo(statePk, "confirmed");
     if (acc?.data) await handleStateData(acc.data, "boot");
@@ -345,9 +821,14 @@ server.listen(PORT, async () => {
     console.warn("[Boot] initial state read failed:", e.message);
   }
 
-  // Primary: WebSocket account subscriptions (sub-second latency)
-  await subscribeAccounts();
+  // Seed initial vault baseline
+  try {
+    const bal = await connection.getTokenAccountBalance(vaultPk, "confirmed");
+    lastVaultAmountStr = bal?.value?.amount || "0";
+  } catch (e) {
+    console.warn("[Boot] initial vault read failed:", e.message);
+  }
 
-  // Secondary: 1-second safety poll (catches any dropped WS notifications)
+  await subscribeAccounts();
   setTimeout(safetyPoll, POLL_MS);
 });
