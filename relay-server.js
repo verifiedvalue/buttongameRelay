@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * Button Game – Relay Server  (WebSocket subscription edition)
  *
@@ -24,22 +22,13 @@
  *   CHALLENGE_TTL_MS – default 5 minutes
  */
 
+"use strict";
+
 const http = require("http");
 const { Connection, PublicKey } = require("@solana/web3.js");
 const { Pool } = require("pg");
 const nacl = require("tweetnacl");
-
-// bs58 sometimes comes through as { default: fnObj } depending on bundling/interop
-const bs58Pkg = require("bs58");
-const bs58 = bs58Pkg?.default ? bs58Pkg.default : bs58Pkg;
-
-// Helpful crash visibility on Railway
-process.on("unhandledRejection", (err) => {
-  console.error("[FATAL] unhandledRejection:", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[FATAL] uncaughtException:", err);
-});
+const bs58 = require("bs58");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const PORT    = Number(process.env.PORT || 3001);
@@ -179,6 +168,7 @@ async function persistClaim(entry) {
 const usernameCache = new Map(); // address -> username
 const usernameCacheLoadedAtMs = { v: 0 };
 
+// Load all usernames (small scale), or you can replace with batch fetch per address.
 async function loadAllUsernames() {
   if (!pgEnabled() || !pgReady) return;
   const { rows } = await pgPool.query(`SELECT address, username FROM usernames`);
@@ -190,6 +180,7 @@ async function loadAllUsernames() {
 
 async function upsertUsername(address, username) {
   if (!pgEnabled() || !pgReady) {
+    // allow in-memory only fallback (not recommended)
     usernameCache.set(address, username);
     return;
   }
@@ -212,6 +203,7 @@ function validateUsername(u) {
   if (username.length < USERNAME_MIN_LEN) return { ok: false, reason: `min length ${USERNAME_MIN_LEN}` };
   if (username.length > USERNAME_MAX_LEN) return { ok: false, reason: `max length ${USERNAME_MAX_LEN}` };
 
+  // Allowed: letters, numbers, underscore, dash, dot
   if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
     return { ok: false, reason: "only letters, numbers, _, -, . allowed" };
   }
@@ -236,6 +228,7 @@ function namesForAddresses(addresses) {
 const challenges = new Map(); // address -> { nonce, expiresAtMs }
 
 function makeNonce() {
+  // fast nonce (good enough for auth challenge)
   return `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
 }
 
@@ -257,6 +250,7 @@ function getChallenge(address) {
 }
 
 function buildUsernameMessage(address, username, nonce) {
+  // IMPORTANT: client must sign EXACTLY this string (UTF-8)
   return [
     "ButtonGame Username Set",
     `Address: ${address}`,
@@ -266,14 +260,17 @@ function buildUsernameMessage(address, username, nonce) {
 }
 
 function verifyUsernameSignature({ address, username, signature, nonce }) {
+  // Validate pubkey
   let pk;
   try { pk = new PublicKey(address); }
   catch { return { ok: false, reason: "invalid address" }; }
 
+  // Validate nonce
   const c = getChallenge(address);
   if (!c) return { ok: false, reason: "no active challenge (or expired). call /challenge first" };
   if (c.nonce !== nonce) return { ok: false, reason: "nonce mismatch" };
 
+  // Decode signature
   let sigBytes;
   try { sigBytes = bs58.decode(signature); }
   catch { return { ok: false, reason: "invalid signature encoding" }; }
@@ -285,7 +282,9 @@ function verifyUsernameSignature({ address, username, signature, nonce }) {
   const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
   if (!ok) return { ok: false, reason: "signature verification failed" };
 
+  // One-time challenge (prevents replay)
   challenges.delete(address);
+
   return { ok: true };
 }
 
@@ -297,7 +296,7 @@ const connection = new Connection(RPC_URL, {
 const statePk = new PublicKey(STATE_ADDR);
 const vaultPk = new PublicKey(VAULT_ADDR);
 
-// ─── DECODE STATE (defined ONCE) ───────────────────────────────────────────
+// ─── DECODE STATE ──────────────────────────────────────────────────────────
 function readPubkey(data, offset) {
   return new PublicKey(data.slice(offset, offset + 32)).toBase58();
 }
@@ -355,6 +354,33 @@ let lastVaultAmountStr = null;
 const claimLog = [];
 let pendingClaim = null;
 
+async function findClaimTxSignature(detectedAtMs) {
+  try {
+    const limit = 20;
+    const sigInfos = await connection.getSignaturesForAddress(statePk, { limit });
+    if (!Array.isArray(sigInfos) || sigInfos.length === 0) return null;
+
+    const targetSec = Math.floor((detectedAtMs ?? Date.now()) / 1000);
+    let best = null;
+    let bestDiff = Infinity;
+
+    for (const info of sigInfos) {
+      if (!info.blockTime) continue;
+      const diff = Math.abs(info.blockTime - targetSec);
+      if (diff < bestDiff) {
+        best = info;
+        bestDiff = diff;
+      }
+    }
+
+    const chosen = best || sigInfos[0];
+    return chosen && chosen.signature ? chosen.signature : null;
+  } catch (e) {
+    console.warn("[ClaimTx] lookup failed:", e.message);
+    return null;
+  }
+}
+
 function stateSignature(gs) {
   return [
     gs.enabled ? 1 : 0,
@@ -367,13 +393,28 @@ function stateSignature(gs) {
   ].join("|");
 }
 
+function broadcast(data) {
+  // Attach names mapping to any message that has addresses
+  // (so clients can render usernames everywhere without extra calls)
+  const enriched = enrichWithNames(data);
+
+  const msg = `data: ${JSON.stringify(enriched)}\n\n`;
+  latestPayload = msg;
+  for (const res of clients) {
+    try { res.write(msg); }
+    catch { clients.delete(res); }
+  }
+}
+
 function safeBigInt(s) {
   try { return BigInt(s); } catch { return null; }
 }
 
+// Collect addresses from payload to attach `{ names: { address: username } }`
 function enrichWithNames(payload) {
   const addrs = new Set();
 
+  // state payload
   if (payload?.state) {
     const s = payload.state;
     if (s.owner) addrs.add(s.owner);
@@ -383,23 +424,18 @@ function enrichWithNames(payload) {
     if (s.currentWinnerAta) addrs.add(s.currentWinnerAta);
   }
 
-  if (payload?.claim?.winner) addrs.add(payload.claim.winner);
+  // claim payload
+  if (payload?.claim) {
+    const c = payload.claim;
+    if (c.winner) addrs.add(c.winner);
+  }
+
+  // username payload
   if (payload?.address) addrs.add(payload.address);
 
   const names = namesForAddresses([...addrs]);
   if (Object.keys(names).length) return { ...payload, names };
   return payload;
-}
-
-function broadcast(data) {
-  const enriched = enrichWithNames(data);
-  const msg = `data: ${JSON.stringify(enriched)}\n\n`;
-  latestPayload = msg;
-
-  for (const res of clients) {
-    try { res.write(msg); }
-    catch { clients.delete(res); }
-  }
 }
 
 function pushClaim(entry) {
@@ -421,10 +457,12 @@ function detectClaimTransition(gs, source) {
   if (!transitioned) return;
 
   if (pendingClaim) {
-    pushClaim({
+    const entry = {
       ...pendingClaim,
+      amount: pendingClaim.amount ?? null,
       note: (pendingClaim.note ? pendingClaim.note + " | " : "") + "superseded-by-new-pending",
-    });
+    };
+    pushClaim(entry);
   }
 
   pendingClaim = {
@@ -439,12 +477,12 @@ function detectClaimTransition(gs, source) {
     vaultAfter: null,
     amount: null,
     note: null,
+    tx: null,
   };
 }
 
 async function refreshVault(gs, reason) {
   if (vaultFetchInFlight) return;
-
   const nowMs      = Date.now();
   const plays      = gs.sessionPlays;
   const changed    = lastPlaysSeen !== null && plays !== lastPlaysSeen;
@@ -464,6 +502,10 @@ async function refreshVault(gs, reason) {
 
     if (pendingClaim) {
       pendingClaim.vaultAfter = vaultAmount;
+
+      if (!pendingClaim.tx) {
+        pendingClaim.tx = await findClaimTxSignature(pendingClaim.detectedAtMs);
+      }
 
       const beforeBI = safeBigInt(pendingClaim.vaultBefore);
       const afterBI  = safeBigInt(pendingClaim.vaultAfter);
@@ -512,6 +554,7 @@ async function handleStateData(rawData, source) {
   if (changed) {
     lastStateSig = sig;
     console.log(`[State] changed via ${source} — plays=${gs.sessionPlays} timerEnd=${gs.timerEnd}`);
+
     broadcast({ type: "state", serverTs: Math.floor(Date.now() / 1000), state: gs });
     await refreshVault(gs, source);
   } else {
@@ -589,14 +632,17 @@ function readJsonBody(req) {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 1_000_000) {
+      if (body.length > 1_000_000) { // 1MB limit
         reject(new Error("body too large"));
         req.destroy();
       }
     });
     req.on("end", () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
-      catch { reject(new Error("invalid json")); }
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(new Error("invalid json"));
+      }
     });
   });
 }
@@ -611,6 +657,7 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, "http://localhost");
 
+  // SSE
   if (url.pathname === "/events" && req.method === "GET") {
     res.writeHead(200, {
       "Content-Type":      "text/event-stream",
@@ -637,6 +684,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // one-shot state snapshot
   if (url.pathname === "/state" && req.method === "GET") {
     if (!latestPayload) {
       res.writeHead(503, { "Content-Type": "application/json" });
@@ -649,6 +697,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // claim log
   if (url.pathname === "/claims" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -659,6 +708,8 @@ const server = http.createServer(async (req, res) => {
     }));
     return;
   }
+
+  // ── USERNAMES ──────────────────────────────────────────────────────────
 
   // GET /challenge?address=...
   if (url.pathname === "/challenge" && req.method === "GET") {
@@ -706,6 +757,7 @@ const server = http.createServer(async (req, res) => {
     const signature = (body.signature || "").trim();
     const nonce = (body.nonce || "").trim();
 
+    // Validate username format
     const v = validateUsername(usernameInput);
     if (!v.ok) {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -714,6 +766,7 @@ const server = http.createServer(async (req, res) => {
     }
     const username = v.username;
 
+    // Verify signature
     const ver = verifyUsernameSignature({ address, username, signature, nonce });
     if (!ver.ok) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -729,6 +782,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Broadcast username update so all clients can update UI immediately
     broadcast({
       type: "username",
       serverTs: Math.floor(Date.now() / 1000),
@@ -741,6 +795,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // health
   if (url.pathname === "/health") {
     const lastClaim = claimLog.length ? claimLog[claimLog.length - 1] : null;
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -774,18 +829,22 @@ server.listen(PORT, async () => {
   console.log(`  RPC  : ${RPC_URL}`);
   console.log(`  WS   : ${WS_URL}\n`);
 
+  // Init DB + load caches
   try {
     await initPg();
+
     if (pgEnabled() && pgReady) {
       const loadedClaims = await loadRecentClaims(CLAIM_LOG_MAX);
       for (const c of loadedClaims) claimLog.push(c);
       console.log(`[DB] loaded ${loadedClaims.length} recent claims into memory`);
+
       await loadAllUsernames();
     }
   } catch (e) {
     console.warn("[DB] init/load failed:", e.message);
   }
 
+  // Seed initial state
   try {
     const acc = await connection.getAccountInfo(statePk, "confirmed");
     if (acc?.data) await handleStateData(acc.data, "boot");
@@ -794,6 +853,7 @@ server.listen(PORT, async () => {
     console.warn("[Boot] initial state read failed:", e.message);
   }
 
+  // Seed initial vault baseline
   try {
     const bal = await connection.getTokenAccountBalance(vaultPk, "confirmed");
     lastVaultAmountStr = bal?.value?.amount || "0";
