@@ -50,6 +50,7 @@ const CHALLENGE_TTL_MS = Number(process.env.CHALLENGE_TTL_MS || 5 * 60 * 1000);
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMITS = {
   "/state":               Number(process.env.RATE_LIMIT_STATE || 60),
+  "/wallet-state":        Number(process.env.RATE_LIMIT_WALLET_STATE || 120),
   "/challenge":           Number(process.env.RATE_LIMIT_CHALLENGE || 20),
   "/username/available":  Number(process.env.RATE_LIMIT_USERNAME_AVAILABLE || 30),
   "/usernames":           Number(process.env.RATE_LIMIT_USERNAMES || 60),
@@ -76,9 +77,13 @@ const DEFAULT_WS = CLUSTER === "mainnet-beta"
 
 const RPC_URL = process.env.RPC_URL || DEFAULT_HTTP;
 const WS_URL  = process.env.WS_URL  || DEFAULT_WS;
+const GAME_MINT_ADDR = process.env.GAME_MINT || "";
+const WALLET_STATE_TTL_MS = Number(process.env.WALLET_STATE_TTL_MS || 2500);
 
 const STATE_ADDR = "5sfJLUePwpDJuxUY9X2cW8DKafq7bqxrQ6XD61tWUvQr";
 const VAULT_ADDR = "2436ZcMWA61as89tT99RURppUpT7CjkDoFHmwskwStSa";
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 const VAULT_TTL_MS = 30_000;
 
@@ -412,17 +417,23 @@ function decodeState(accountData) {
 
 // ─── RELAY STATE ───────────────────────────────────────────────────────────
 let latestPayload      = null;
+let latestSnapshot     = null;
 let lastStateSig       = "";
 let lastPlaysSeen      = null;
 let lastVaultFetchMs   = 0;
 let vaultFetchInFlight = false;
 const clients          = new Set();
+let stateVersion       = 0;
+let sseEventId         = 0;
+const recentEvents     = [];
+const RECENT_EVENTS_MAX = Number(process.env.SSE_RECENT_EVENTS_MAX || 300);
 
 let lastGs = null;
 let lastVaultAmountStr = null;
 
 const claimLog = [];
 let pendingClaim = null;
+const walletStateCache = new Map(); // address -> { expiresAtMs, data }
 
 async function findClaimTxSignature(detectedAtMs) {
   try {
@@ -463,13 +474,44 @@ function stateSignature(gs) {
   ].join("|");
 }
 
+function computeCanonicalPhase(gs, nowSec) {
+  if (!gs?.enabled) return "DISABLED";
+  if (gs.timerEnd === 0) return "IDLE";
+  if (!gs.unclaimed) return "IDLE";
+  if (nowSec < gs.timerEnd) return "ACTIVE";
+  if (nowSec <= gs.cooldownEnd) return "COOLDOWN";
+  return "POST_COOLDOWN_UNCLAIMED";
+}
+
+function makeStateEvent(gs, vaultAmount = null) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const event = {
+    type: "state",
+    serverTs: nowSec,
+    stateVersion,
+    phase: computeCanonicalPhase(gs, nowSec),
+    state: gs,
+  };
+  if (vaultAmount != null) {
+    event.vaultAmount = vaultAmount;
+    const vb = safeBigInt(vaultAmount);
+    const divisor = gs.sessionPlays < 250 ? 40n : (gs.sessionPlays < 1000 ? 10n : 5n);
+    if (vb != null && divisor > 0n) event.potAmount = (vb / divisor).toString();
+  }
+  return event;
+}
+
 function broadcast(data) {
   // Attach names mapping to any message that has addresses
   // (so clients can render usernames everywhere without extra calls)
   const enriched = enrichWithNames(data);
 
-  const msg = `data: ${JSON.stringify(enriched)}\n\n`;
+  const id = ++sseEventId;
+  const msg = `id: ${id}\ndata: ${JSON.stringify(enriched)}\n\n`;
   latestPayload = msg;
+  if (enriched?.type === "state") latestSnapshot = enriched;
+  recentEvents.push({ id, msg });
+  while (recentEvents.length > RECENT_EVENTS_MAX) recentEvents.shift();
   for (const res of [...clients]) {
     try {
       if (!res.writableEnded) res.write(msg);
@@ -486,6 +528,14 @@ function broadcast(data) {
 
 function safeBigInt(s) {
   try { return BigInt(s); } catch { return null; }
+}
+
+function findAta(ownerPk, mintPk) {
+  const [ata] = PublicKey.findProgramAddressSync(
+    [ownerPk.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  return ata;
 }
 
 // Collect addresses from payload to attach `{ names: { address: username } }`
@@ -601,12 +651,7 @@ async function refreshVault(gs, reason) {
       pendingClaim = null;
     }
 
-    broadcast({
-      type: "state",
-      serverTs: Math.floor(Date.now() / 1000),
-      state: gs,
-      vaultAmount,
-    });
+    broadcast(makeStateEvent(gs, vaultAmount));
   } catch (e) {
     console.warn(`[Vault] fetch failed (${reason}):`, e.message);
     if (pendingClaim) {
@@ -630,10 +675,11 @@ async function handleStateData(rawData, source) {
   if (changed) detectClaimTransition(gs, source);
 
   if (changed) {
+    stateVersion += 1;
     lastStateSig = sig;
     console.log(`[State] changed via ${source} — plays=${gs.sessionPlays} timerEnd=${gs.timerEnd}`);
 
-    broadcast({ type: "state", serverTs: Math.floor(Date.now() / 1000), state: gs });
+    broadcast(makeStateEvent(gs));
     await refreshVault(gs, source);
   } else {
     await refreshVault(gs, `${source}-ttl`);
@@ -842,7 +888,17 @@ const server = http.createServer(async (req, res) => {
     }
     res.write(`retry: ${SSE_RETRY_MS}\n`);
     res.write(": connected\n\n");
-    if (latestPayload) res.write(latestPayload);
+    const lastEventIdRaw = req.headers["last-event-id"];
+    const lastEventId = Number(Array.isArray(lastEventIdRaw) ? lastEventIdRaw[0] : lastEventIdRaw);
+    if (Number.isFinite(lastEventId) && lastEventId > 0) {
+      for (const ev of recentEvents) {
+        if (ev.id > lastEventId) {
+          try { res.write(ev.msg); } catch {}
+        }
+      }
+    } else if (latestPayload) {
+      res.write(latestPayload);
+    }
 
     sseConnectionAdd(res, ip);
     clients.add(res);
@@ -876,14 +932,13 @@ const server = http.createServer(async (req, res) => {
 
   // one-shot state snapshot
   if (url.pathname === "/state" && req.method === "GET") {
-    if (!latestPayload) {
+    if (!latestSnapshot) {
       res.writeHead(503, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "State not yet available, retry in 1s" }));
       return;
     }
-    const payload = latestPayload.replace(/^data: /, "").trim();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(payload);
+    res.end(JSON.stringify(latestSnapshot));
     return;
   }
 
@@ -897,6 +952,66 @@ const server = http.createServer(async (req, res) => {
       persisted: pgEnabled() && pgReady,
     }));
     return;
+  }
+
+  // wallet state (ATA + balance), cached briefly to reduce wallet-switch RPC bursts
+  if (url.pathname === "/wallet-state" && req.method === "GET") {
+    const address = (url.searchParams.get("address") || "").trim();
+    let ownerPk;
+    try { ownerPk = new PublicKey(address); } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid address" }));
+      return;
+    }
+
+    const nowMs = Date.now();
+    const cached = walletStateCache.get(address);
+    if (cached && cached.expiresAtMs > nowMs) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...cached.data, fromCache: true }));
+      return;
+    }
+
+    const mint58 = latestSnapshot?.state?.tokenMint || GAME_MINT_ADDR;
+    if (!mint58) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "mint unavailable" }));
+      return;
+    }
+
+    let mintPk;
+    try { mintPk = new PublicKey(mint58); } catch {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid relay mint config" }));
+      return;
+    }
+
+    try {
+      const ata = findAta(ownerPk, mintPk);
+      const info = await connection.getAccountInfo(ata, "confirmed");
+      const ataExists = !!info;
+      let balanceRaw = "0";
+      if (ataExists) {
+        const bal = await connection.getTokenAccountBalance(ata, "confirmed");
+        balanceRaw = bal?.value?.amount || "0";
+      }
+      const payload = {
+        address,
+        ata: ata.toBase58(),
+        ataExists,
+        balanceRaw,
+        mint: mintPk.toBase58(),
+        cachedAtMs: nowMs,
+      };
+      walletStateCache.set(address, { expiresAtMs: nowMs + WALLET_STATE_TTL_MS, data: payload });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...payload, fromCache: false }));
+      return;
+    } catch (e) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `wallet-state unavailable: ${e.message}` }));
+      return;
+    }
   }
 
   // ── USERNAMES ──────────────────────────────────────────────────────────
@@ -1021,6 +1136,8 @@ const server = http.createServer(async (req, res) => {
       clients:      clients.size,
       wsSubscribed: stateSubId != null,
       lastStateSig,
+      stateVersion,
+      sseEventId,
       uptime:       Math.floor(process.uptime()),
       claimCount:   claimLog.length,
       lastClaim,
@@ -1031,7 +1148,8 @@ const server = http.createServer(async (req, res) => {
       usernames: {
         cached: usernameCache.size,
         cacheLoadedAtMs: usernameCacheLoadedAtMs.v,
-      }
+      },
+      walletStateCacheSize: walletStateCache.size,
     }));
     return;
   }
