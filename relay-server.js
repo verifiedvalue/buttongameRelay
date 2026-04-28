@@ -20,6 +20,9 @@
  *   USERNAME_MAX_LEN – default 18
  *   USERNAME_MIN_LEN – default 3
  *   CHALLENGE_TTL_MS – default 5 minutes
+ *   Rate limits (per IP per minute): RATE_LIMIT_STATE, RATE_LIMIT_CHALLENGE,
+ *   RATE_LIMIT_USERNAME_AVAILABLE, RATE_LIMIT_USERNAMES, RATE_LIMIT_CLAIMS,
+ *   RATE_LIMIT_HEALTH, RATE_LIMIT_USERNAME_POST; RATE_LIMIT_SSE_CONCURRENT = max SSE connections per IP.
  */
 
 "use strict";
@@ -34,12 +37,27 @@ const bs58 = require("bs58");
 const PORT    = Number(process.env.PORT || 3001);
 const CLUSTER = process.env.CLUSTER || "devnet";
 const POLL_MS = Number(process.env.POLL_MS || 1000);
+const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
+const SSE_RETRY_MS = Number(process.env.SSE_RETRY_MS || 3000);
 
 const CLAIM_LOG_MAX = Number(process.env.CLAIM_LOG_MAX || 200);
 
 const USERNAME_MIN_LEN = Number(process.env.USERNAME_MIN_LEN || 3);
 const USERNAME_MAX_LEN = Number(process.env.USERNAME_MAX_LEN || 18);
 const CHALLENGE_TTL_MS = Number(process.env.CHALLENGE_TTL_MS || 5 * 60 * 1000);
+
+// Rate limits (per IP) — generous for normal use, enough to curb abuse
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMITS = {
+  "/state":               Number(process.env.RATE_LIMIT_STATE || 60),
+  "/challenge":           Number(process.env.RATE_LIMIT_CHALLENGE || 20),
+  "/username/available":  Number(process.env.RATE_LIMIT_USERNAME_AVAILABLE || 30),
+  "/usernames":           Number(process.env.RATE_LIMIT_USERNAMES || 60),
+  "/claims":              Number(process.env.RATE_LIMIT_CLAIMS || 60),
+  "/health":              Number(process.env.RATE_LIMIT_HEALTH || 120),
+  "POST:/username":      Number(process.env.RATE_LIMIT_USERNAME_POST || 10),
+};
+const RATE_LIMIT_SSE_MAX_CONCURRENT = Number(process.env.RATE_LIMIT_SSE_CONCURRENT || 10);
 
 const CLAIM_DB = (process.env.CLAIM_DB || "postgres").toLowerCase();
 const CLAIM_DB_URL =
@@ -182,22 +200,49 @@ async function loadAllUsernames() {
   console.log(`[DB] loaded ${rows.length} usernames into cache`);
 }
 
+const USERNAME_TAKEN_ERR = "Username already taken";
+
 async function upsertUsername(address, username) {
+  const norm = (s) => String(s || "").trim().toLowerCase();
+  const want = norm(username);
+
   if (!pgEnabled() || !pgReady) {
-    // allow in-memory only fallback (not recommended)
+    // In-memory: enforce no duplicate (same process)
+    for (const [addr, un] of usernameCache) {
+      if (addr !== address && norm(un) === want) throw new Error(USERNAME_TAKEN_ERR);
+    }
     usernameCache.set(address, username);
     return;
   }
 
-  await pgPool.query(
-    `INSERT INTO usernames (address, username, updated_at)
-     VALUES ($1, $2, now())
-     ON CONFLICT (address)
-     DO UPDATE SET username = EXCLUDED.username, updated_at = now();`,
-    [address, username]
-  );
-
-  usernameCache.set(address, username);
+  // Postgres: run duplicate check + upsert in a transaction to avoid races
+  const client = await pgPool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT address FROM usernames WHERE LOWER(TRIM(username)) = $1`,
+      [want]
+    );
+    const takenByOther = rows.some((r) => r.address !== address);
+    if (takenByOther) {
+      await client.query("ROLLBACK");
+      throw new Error(USERNAME_TAKEN_ERR);
+    }
+    await client.query(
+      `INSERT INTO usernames (address, username, updated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (address)
+       DO UPDATE SET username = EXCLUDED.username, updated_at = now();`,
+      [address, username]
+    );
+    await client.query("COMMIT");
+    usernameCache.set(address, username);
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 function validateUsername(u) {
@@ -425,9 +470,17 @@ function broadcast(data) {
 
   const msg = `data: ${JSON.stringify(enriched)}\n\n`;
   latestPayload = msg;
-  for (const res of clients) {
-    try { res.write(msg); }
-    catch { clients.delete(res); }
+  for (const res of [...clients]) {
+    try {
+      if (!res.writableEnded) res.write(msg);
+      else {
+        sseConnectionRemove(res);
+        clients.delete(res);
+      }
+    } catch {
+      sseConnectionRemove(res);
+      clients.delete(res);
+    }
   }
 }
 
@@ -593,6 +646,8 @@ async function handleStateData(rawData, source) {
 let stateSubId       = null;
 let vaultSubId       = null;
 let wsReconnectTimer = null;
+let wsReconnectAttempts = 0;
+let pollErrorStreak = 0;
 
 async function subscribeAccounts() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
@@ -620,15 +675,20 @@ async function subscribeAccounts() {
     );
 
     console.log(`[WS] subscribed — stateSubId=${stateSubId}  vaultSubId=${vaultSubId}`);
+    wsReconnectAttempts = 0;
   } catch (e) {
     console.error("[WS] subscribe error:", e.message);
-    scheduleWsReconnect();
+    scheduleWsReconnect("subscribe-error");
   }
 }
 
-function scheduleWsReconnect(delayMs = 5000) {
+function scheduleWsReconnect(reason = "unspecified") {
   if (wsReconnectTimer) return;
-  console.log(`[WS] scheduling reconnect in ${delayMs}ms`);
+  wsReconnectAttempts += 1;
+  const base = Math.min(60_000, 1000 * (2 ** Math.min(wsReconnectAttempts, 6)));
+  const jitter = Math.floor(Math.random() * 750);
+  const delayMs = base + jitter;
+  console.log(`[WS] scheduling reconnect in ${delayMs}ms (attempt=${wsReconnectAttempts}, reason=${reason})`);
   wsReconnectTimer = setTimeout(async () => {
     wsReconnectTimer = null;
     try {
@@ -644,8 +704,14 @@ async function safetyPoll() {
   try {
     const acc = await connection.getAccountInfo(statePk, "confirmed");
     if (acc?.data) await handleStateData(acc.data, "poll");
+    pollErrorStreak = 0;
   } catch (e) {
     console.warn("[Poll] error:", e.message);
+    pollErrorStreak += 1;
+    if (pollErrorStreak >= 3) {
+      scheduleWsReconnect("poll-error-streak");
+      pollErrorStreak = 0;
+    }
   } finally {
     setTimeout(safetyPoll, POLL_MS);
   }
@@ -672,6 +738,68 @@ function readJsonBody(req) {
   });
 }
 
+// ─── RATE LIMITING ─────────────────────────────────────────────────────────
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    const first = typeof forwarded === "string" ? forwarded.split(",")[0] : forwarded[0];
+    return (first && first.trim()) || req.socket?.remoteAddress || "unknown";
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+const rateLimitBuckets = new Map(); // path -> Map(ip -> { count, resetAt })
+function checkRateLimit(ip, pathKey) {
+  const max = RATE_LIMITS[pathKey];
+  if (!max || max <= 0) return { limited: false };
+  let byIp = rateLimitBuckets.get(pathKey);
+  if (!byIp) {
+    byIp = new Map();
+    rateLimitBuckets.set(pathKey, byIp);
+  }
+  const now = Date.now();
+  for (const [k, v] of byIp) {
+    if (now >= v.resetAt) byIp.delete(k);
+  }
+  let entry = byIp.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    byIp.set(ip, entry);
+  }
+  entry.count++;
+  if (entry.count > max) {
+    return { limited: true, retryAfterSec: Math.ceil((entry.resetAt - now) / 1000) };
+  }
+  return { limited: false };
+}
+
+const sseClientIp = new Map(); // res -> ip (for SSE connections)
+const sseCountByIp = new Map(); // ip -> number of active SSE connections
+function sseConnectionCount(ip) {
+  return sseCountByIp.get(ip) || 0;
+}
+function sseConnectionAdd(res, ip) {
+  sseClientIp.set(res, ip);
+  sseCountByIp.set(ip, (sseCountByIp.get(ip) || 0) + 1);
+}
+function sseConnectionRemove(res) {
+  const ip = sseClientIp.get(res);
+  sseClientIp.delete(res);
+  if (ip) {
+    const n = (sseCountByIp.get(ip) || 1) - 1;
+    if (n <= 0) sseCountByIp.delete(ip);
+    else sseCountByIp.set(ip, n);
+  }
+}
+
+function sendRateLimitResponse(res, retryAfterSec) {
+  res.writeHead(429, {
+    "Content-Type":   "application/json",
+    "Retry-After":    String(Math.max(1, retryAfterSec || 60)),
+  });
+  res.end(JSON.stringify({ error: "Too many requests", retryAfterSec: retryAfterSec || 60 }));
+}
+
 // ─── HTTP / SSE SERVER ─────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -681,31 +809,68 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, "http://localhost");
+  const ip = getClientIp(req);
 
-  // SSE
+  // Rate limit: per-path checks (skip for /events until we know we allow the connection)
+  const pathKey = req.method === "POST" && url.pathname === "/username" ? "POST:/username" : url.pathname;
+  if (pathKey !== "/events") {
+    const rl = checkRateLimit(ip, pathKey);
+    if (rl.limited) {
+      sendRateLimitResponse(res, rl.retryAfterSec);
+      return;
+    }
+  }
+
+  // SSE — limit concurrent connections per IP (multiple tabs ok, abuse not)
   if (url.pathname === "/events" && req.method === "GET") {
+    if (sseConnectionCount(ip) >= RATE_LIMIT_SSE_MAX_CONCURRENT) {
+      sendRateLimitResponse(res, 60);
+      return;
+    }
     res.writeHead(200, {
       "Content-Type":      "text/event-stream",
-      "Cache-Control":     "no-cache",
+      "Cache-Control":     "no-cache, no-transform",
       "Connection":        "keep-alive",
       "X-Accel-Buffering": "no",
     });
+    try {
+      req.socket?.setNoDelay?.(true);
+      req.socket?.setKeepAlive?.(true, 60_000);
+    } catch {}
+    if (typeof res.flushHeaders === "function") {
+      try { res.flushHeaders(); } catch {}
+    }
+    res.write(`retry: ${SSE_RETRY_MS}\n`);
     res.write(": connected\n\n");
     if (latestPayload) res.write(latestPayload);
 
+    sseConnectionAdd(res, ip);
     clients.add(res);
     console.log(`[SSE] +client  total=${clients.size}`);
 
-    const hb = setInterval(() => {
-      try { res.write(": ping\n\n"); }
-      catch { clearInterval(hb); clients.delete(res); }
-    }, 25_000);
-
-    req.on("close", () => {
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       clearInterval(hb);
+      sseConnectionRemove(res);
       clients.delete(res);
       console.log(`[SSE] -client  total=${clients.size}`);
-    });
+    };
+
+    const hb = setInterval(() => {
+      try {
+        if (res.writableEnded) { cleanup(); return; }
+        res.write(`: ping ${Date.now()}\n\n`);
+      } catch {
+        cleanup();
+      }
+    }, SSE_HEARTBEAT_MS);
+
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
     return;
   }
 
@@ -820,7 +985,10 @@ const server = http.createServer(async (req, res) => {
     try {
       await upsertUsername(address, username);
     } catch (e) {
-      const isDuplicate = e?.code === "23505" || /unique|duplicate/i.test(String(e?.message || ""));
+      const isDuplicate =
+        e?.message === USERNAME_TAKEN_ERR ||
+        e?.code === "23505" ||
+        /unique|duplicate|already taken/i.test(String(e?.message || ""));
       if (isDuplicate) {
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Username already taken" }));
@@ -868,8 +1036,23 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // shared server timestamp for clients that want wall-clock alignment
+  if (url.pathname === "/time" && req.method === "GET") {
+    const unixtime = Math.floor(Date.now() / 1000);
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({
+      unixtime,
+      now: unixtime,
+      ms: Date.now(),
+    }));
+    return;
+  }
+
   res.writeHead(404); res.end("Not found");
 });
+server.keepAliveTimeout = 75_000;
+server.headersTimeout = 80_000;
+server.requestTimeout = 0;
 
 // ─── BOOT ──────────────────────────────────────────────────────────────────
 server.listen(PORT, async () => {
@@ -912,4 +1095,11 @@ server.listen(PORT, async () => {
 
   await subscribeAccounts();
   setTimeout(safetyPoll, POLL_MS);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[Process] unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[Process] uncaughtException:", err);
 });
