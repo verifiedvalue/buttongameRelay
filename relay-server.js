@@ -51,6 +51,8 @@ const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMITS = {
   "/state":               Number(process.env.RATE_LIMIT_STATE || 60),
   "/wallet-state":        Number(process.env.RATE_LIMIT_WALLET_STATE || 120),
+  "/tx-context":          Number(process.env.RATE_LIMIT_TX_CONTEXT || 120),
+  "/tx-status":           Number(process.env.RATE_LIMIT_TX_STATUS || 180),
   "/challenge":           Number(process.env.RATE_LIMIT_CHALLENGE || 20),
   "/username/available":  Number(process.env.RATE_LIMIT_USERNAME_AVAILABLE || 30),
   "/usernames":           Number(process.env.RATE_LIMIT_USERNAMES || 60),
@@ -79,6 +81,7 @@ const RPC_URL = process.env.RPC_URL || DEFAULT_HTTP;
 const WS_URL  = process.env.WS_URL  || DEFAULT_WS;
 const GAME_MINT_ADDR = process.env.GAME_MINT || "";
 const WALLET_STATE_TTL_MS = Number(process.env.WALLET_STATE_TTL_MS || 2500);
+const TX_CONTEXT_TTL_MS = Number(process.env.TX_CONTEXT_TTL_MS || 12000);
 
 const STATE_ADDR = "5sfJLUePwpDJuxUY9X2cW8DKafq7bqxrQ6XD61tWUvQr";
 const VAULT_ADDR = "2436ZcMWA61as89tT99RURppUpT7CjkDoFHmwskwStSa";
@@ -434,6 +437,8 @@ let lastVaultAmountStr = null;
 const claimLog = [];
 let pendingClaim = null;
 const walletStateCache = new Map(); // address -> { expiresAtMs, data }
+let txContextCache = null; // { blockhash, lastValidBlockHeight, fetchedAtMs }
+let txContextInFlight = null;
 
 async function findClaimTxSignature(detectedAtMs) {
   try {
@@ -536,6 +541,30 @@ function findAta(ownerPk, mintPk) {
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
   return ata;
+}
+
+async function getTxContext(force = false) {
+  const now = Date.now();
+  if (!force && txContextCache && (now - txContextCache.fetchedAtMs) < TX_CONTEXT_TTL_MS) {
+    return txContextCache;
+  }
+  if (txContextInFlight) return txContextInFlight;
+  const run = (async () => {
+    const latest = await connection.getLatestBlockhash("processed");
+    const out = {
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+      fetchedAtMs: Date.now(),
+    };
+    txContextCache = out;
+    return out;
+  })();
+  txContextInFlight = run;
+  try {
+    return await run;
+  } finally {
+    txContextInFlight = null;
+  }
 }
 
 // Collect addresses from payload to attach `{ names: { address: username } }`
@@ -1014,6 +1043,56 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // tx context for frontend signing flow; relay caches this to avoid client RPC storms.
+  if (url.pathname === "/tx-context" && req.method === "GET") {
+    try {
+      const ctx = await getTxContext(false);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({
+        blockhash: ctx.blockhash,
+        lastValidBlockHeight: ctx.lastValidBlockHeight,
+        fetchedAtMs: ctx.fetchedAtMs,
+        serverTs: Math.floor(Date.now() / 1000),
+        stateVersion,
+      }));
+      return;
+    } catch (e) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `tx-context unavailable: ${e.message}` }));
+      return;
+    }
+  }
+
+  // tx status via relay (frontends avoid direct RPC status polling under load).
+  if (url.pathname === "/tx-status" && req.method === "GET") {
+    const sig = (url.searchParams.get("sig") || "").trim();
+    if (!sig) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "missing sig" }));
+      return;
+    }
+    try {
+      const out = await connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
+      const st = out?.value?.[0] || null;
+      const confirmationStatus = st?.confirmationStatus || null;
+      const err = st?.err ?? null;
+      const done = !!st && (confirmationStatus === "confirmed" || confirmationStatus === "finalized" || err != null);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({
+        sig,
+        found: !!st,
+        done,
+        confirmationStatus,
+        err,
+      }));
+      return;
+    } catch (e) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `tx-status unavailable: ${e.message}` }));
+      return;
+    }
+  }
+
   // ── USERNAMES ──────────────────────────────────────────────────────────
 
   // GET /challenge?address=...
@@ -1150,6 +1229,7 @@ const server = http.createServer(async (req, res) => {
         cacheLoadedAtMs: usernameCacheLoadedAtMs.v,
       },
       walletStateCacheSize: walletStateCache.size,
+      txContextCachedAtMs: txContextCache?.fetchedAtMs || null,
     }));
     return;
   }
