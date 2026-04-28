@@ -1,19 +1,19 @@
 {
-  "name": "button-game-relay",
+  "name": "buttongame-relay",
   "version": "1.0.0",
-  "description": "SSE relay server for Button Game – polls Solana once, fans out to all clients",
+  "private": true,
+  "description": "Relay server for BUTTON game",
   "main": "relay-server.js",
   "scripts": {
     "start": "node relay-server.js"
   },
-  "dependencies": {
-    "@solana/web3.js": "^1.95.0",
-    "cors": "^2.8.5",
-    "pg": "^8.13.1",
-    "tweetnacl": "^1.0.3",
-    "bs58": "^5.0.0"
-  },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "pg": "^8.16.3",
+    "tweetnacl": "^1.0.3"
   }
 }
